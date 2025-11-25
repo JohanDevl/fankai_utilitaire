@@ -69,7 +69,8 @@ class Config:
             "placement": {"name": "Fankai-Placement"},
             "placement_auto": {"name": "Fankai-Placement", "args": ["auto"]},
             "metadata": {"name": "Fankai-Metadata"},
-            "sync": {"name": "Fankai-Sync"}
+            "sync": {"name": "Fankai-Sync"},
+            "placement_scheduler": {"name": "Fankai-PlacementScheduler"}
         }
 
     def get_tool_path(self, tool_key):
@@ -259,6 +260,7 @@ class UIManager:
             "2": {"key": "placement", "desc": "Placer et renommer vos films Kaï téléchargés"},
             "2a": {"key": "placement_auto", "desc": "Placement automatique puis scan des métadonnées", "note": "PLEX SEULEMENT"},
             "3": {"key": "metadata", "desc": "Scanner les métadonnées de votre bibliothèque", "note": "PLEX SEULEMENT"},
+            "4": {"key": "placement_scheduler", "desc": "Configurer le placement automatique quotidien", "note": "PLEX SEULEMENT"},
         }
 
     def display_main_menu(self):
