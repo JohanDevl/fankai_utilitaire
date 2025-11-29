@@ -94,10 +94,12 @@ def handle_interrupt(sig, frame):
 # --- Classes Métier ---
 
 class LockManager:
-    """Gère le verrouillage pour éviter les exécutions simultanées."""
+    """Gère le verrouillage et la file d'attente pour les exécutions concurrentes."""
 
     def __init__(self, lock_path):
         self.lock_path = lock_path
+        self.processing_path = lock_path.parent / '.fankai_placement.processing'
+        self.queue_path = lock_path.parent / '.fankai_placement.queue'
         self.locked = False
 
     def acquire(self):
@@ -118,9 +120,13 @@ class LockManager:
         return True
 
     def release(self):
-        """Libère le verrou."""
-        if self.locked and self.lock_path.exists():
-            self.lock_path.unlink()
+        """Libère le verrou et nettoie les fichiers de suivi."""
+        if self.locked:
+            if self.lock_path.exists():
+                self.lock_path.unlink()
+            if self.processing_path.exists():
+                self.processing_path.unlink()
+            self.clear_queue()
             self.locked = False
 
     def _is_process_running(self, pid):
@@ -130,6 +136,43 @@ class LockManager:
             return True
         except (OSError, ProcessLookupError):
             return False
+
+    def get_processing_files(self):
+        """Retourne la liste des fichiers en cours de traitement."""
+        if not self.processing_path.exists():
+            return set()
+        try:
+            import json
+            with open(self.processing_path, 'r') as f:
+                return set(json.load(f))
+        except (json.JSONDecodeError, FileNotFoundError):
+            return set()
+
+    def set_processing_files(self, files):
+        """Enregistre la liste des fichiers en cours de traitement."""
+        import json
+        with open(self.processing_path, 'w') as f:
+            json.dump(list(files), f)
+
+    def add_to_queue(self, files):
+        """Ajoute des fichiers à la file d'attente."""
+        existing = set(self.get_queued_files())
+        with open(self.queue_path, 'a') as f:
+            for file in files:
+                if file not in existing:
+                    f.write(file + '\n')
+
+    def get_queued_files(self):
+        """Retourne les fichiers en attente."""
+        if not self.queue_path.exists():
+            return []
+        with open(self.queue_path, 'r') as f:
+            return [line.strip() for line in f if line.strip()]
+
+    def clear_queue(self):
+        """Vide la file d'attente."""
+        if self.queue_path.exists():
+            self.queue_path.unlink()
 
 
 class DatabaseManager:
@@ -679,6 +722,51 @@ class Application:
         parser.add_argument("auto", nargs='?', help="Lance le script en mode automatique non-interactif.")
         return parser.parse_args()
 
+    def _add_new_files_to_queue(self):
+        """Ajoute les nouveaux fichiers à la file d'attente quand une instance est déjà en cours."""
+        config = self.db.load_config()
+        download_path = config.get("fankai_telechargement")
+
+        if not download_path or download_path == "FANKAI_TELECHARGEMENT":
+            logging.warning("Chemin de téléchargement non configuré.")
+            return
+
+        current_files = set(self.fs.collect_video_files(download_path))
+        processing_files = self.lock.get_processing_files()
+        queued_files = set(self.lock.get_queued_files())
+        new_files = current_files - processing_files - queued_files
+
+        if new_files:
+            self.lock.add_to_queue(new_files)
+            logging.info(f"{len(new_files)} fichier(s) ajouté(s) à la file d'attente.")
+        else:
+            logging.info("Aucun nouveau fichier à ajouter à la file d'attente.")
+
+    def _process_batch(self, video_files, media_path, download_path, placement_method, nfo_files):
+        """Traite un lot de fichiers vidéo."""
+        if not video_files:
+            return set()
+
+        self.lock.set_processing_files(video_files)
+        rename_dict = self.db.load_rename_dict()
+        standard_matches, unmatched, op_matches = self.matcher.find_matches(video_files, nfo_files, rename_dict)
+
+        updated_series = set()
+        if not standard_matches and not op_matches and not unmatched:
+            logging.warning("Aucune correspondance trouvée pour les fichiers vidéo.")
+        else:
+            placed_files, batch_series = self.placer.place_files(standard_matches, op_matches, placement_method, media_path)
+            updated_series.update(batch_series)
+
+            if placed_files:
+                logging.info(f"\nPlacement terminé. {len(placed_files)} fichier(s) source traité(s).")
+                if placement_method == 'c':
+                    self.ui.confirm_cleanup(placed_files)
+
+            self.ui.handle_unmatched(unmatched, nfo_files, placement_method, media_path)
+
+        return updated_series
+
     def run(self):
         """Point d'entrée principal de l'application."""
         self.config.ensure_dirs_exist()
@@ -687,23 +775,16 @@ class Application:
 
         if not self.lock.acquire():
             logging.warning("Une autre instance de Fankai-Placement est déjà en cours d'exécution.")
-            logging.warning("Cette exécution sera ignorée.")
+            self._add_new_files_to_queue()
             return
 
         try:
             self.ui.display_intro()
-
             self.db.update_rename_list_from_github(self.config.github_repo)
 
             paths = self.ui.get_paths()
             media_path, download_path = paths['media'], paths['download']
-
             placement_method = self.ui.get_placement_method()
-
-            clear_host()
-            logging.info("Préparation de l'analyse...")
-
-            video_files = self.fs.collect_video_files(download_path)
 
             plex_enabled = self.ui.confirm_plex_usage()
             if plex_enabled:
@@ -711,36 +792,44 @@ class Application:
             else:
                 nfo_files = self.fs.list_nfo_files(media_path)
 
-            if not video_files:
-                logging.warning("Aucun fichier vidéo trouvé dans le dossier de téléchargement. Fin du script.")
-                return
-
             if not nfo_files:
-                logging.warning("Aucun fichier NFO de référence trouvé (localement ou via l'API). Impossible de trouver des correspondances.")
+                logging.warning("Aucun fichier NFO de référence trouvé (localement ou via l'API).")
                 return
 
-            rename_dict = self.db.load_rename_dict()
+            all_updated_series = set()
+            iteration = 0
 
-            standard_matches, unmatched, op_matches = self.matcher.find_matches(video_files, nfo_files, rename_dict)
+            while True:
+                iteration += 1
+                clear_host()
 
-            if not standard_matches and not op_matches and not unmatched:
-                 logging.warning("Aucune correspondance trouvée pour les fichiers vidéo.")
-            else:
-                placed_files, updated_series = self.placer.place_files(standard_matches, op_matches, placement_method, media_path)
-
-                if placed_files:
-                    logging.info(f"\nPlacement terminé. {len(placed_files)} fichier(s) source traité(s).")
-                    logging.info(f"Séries mises à jour : {', '.join(updated_series) or 'Aucune'}")
-
-                    if placement_method == 'c':
-                        self.ui.confirm_cleanup(placed_files)
-
-                    if self.ui.ask_yes_no("Lancer Fankai-Metadata pour mettre à jour les métadonnées ?", default_yes=self.args.auto):
-                        self.fs.launch_metadata_script(self.config.metadata_script_path, list(updated_series))
+                if iteration == 1:
+                    logging.info("Préparation de l'analyse...")
+                    video_files = self.fs.collect_video_files(download_path)
                 else:
-                    logging.info("Aucun nouveau fichier n'a été placé.")
+                    logging.info("Traitement des fichiers ajoutés à la file d'attente...")
+                    queued = self.lock.get_queued_files()
+                    self.lock.clear_queue()
+                    video_files = [f for f in queued if os.path.exists(f)]
 
-            self.ui.handle_unmatched(unmatched, nfo_files, placement_method, media_path)
+                if not video_files:
+                    if iteration == 1:
+                        logging.warning("Aucun fichier vidéo trouvé dans le dossier de téléchargement.")
+                    break
+
+                batch_series = self._process_batch(video_files, media_path, download_path, placement_method, nfo_files)
+                all_updated_series.update(batch_series)
+
+                queued = self.lock.get_queued_files()
+                if not queued:
+                    break
+
+            if all_updated_series:
+                logging.info(f"\nSéries mises à jour : {', '.join(all_updated_series)}")
+                if self.ui.ask_yes_no("Lancer Fankai-Metadata pour mettre à jour les métadonnées ?", default_yes=self.args.auto):
+                    self.fs.launch_metadata_script(self.config.metadata_script_path, list(all_updated_series))
+            else:
+                logging.info("Aucun nouveau fichier n'a été placé.")
 
             logging.info("\nScript terminé.")
         finally:
