@@ -93,6 +93,45 @@ def handle_interrupt(sig, frame):
 
 # --- Classes Métier ---
 
+class LockManager:
+    """Gère le verrouillage pour éviter les exécutions simultanées."""
+
+    def __init__(self, lock_path):
+        self.lock_path = lock_path
+        self.locked = False
+
+    def acquire(self):
+        """Tente d'acquérir le verrou. Retourne True si réussi, False sinon."""
+        if self.lock_path.exists():
+            try:
+                with open(self.lock_path, 'r') as f:
+                    pid = int(f.read().strip())
+                if self._is_process_running(pid):
+                    return False
+                self.lock_path.unlink()
+            except (ValueError, FileNotFoundError):
+                pass
+
+        with open(self.lock_path, 'w') as f:
+            f.write(str(os.getpid()))
+        self.locked = True
+        return True
+
+    def release(self):
+        """Libère le verrou."""
+        if self.locked and self.lock_path.exists():
+            self.lock_path.unlink()
+            self.locked = False
+
+    def _is_process_running(self, pid):
+        """Vérifie si un processus avec ce PID est en cours."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+
 class DatabaseManager:
     """Gère toutes les opérations sur la base de données SQLite."""
     def __init__(self, db_path):
@@ -627,6 +666,7 @@ class Application:
     def __init__(self):
         self.args = self._parse_arguments()
         self.config = Config()
+        self.lock = LockManager(self.config.fankai_app_path / '.fankai_placement.lock')
         self.db = DatabaseManager(self.config.db_path)
         self.fs = FileSystemManager()
         self.matcher = FileMatcher()
@@ -644,59 +684,67 @@ class Application:
         self.config.ensure_dirs_exist()
         os.chdir(self.config.fankai_app_path)
         setup_logging(self.config.log_path)
-        
-        self.ui.display_intro()
-        
-        self.db.update_rename_list_from_github(self.config.github_repo)
-        
-        paths = self.ui.get_paths()
-        media_path, download_path = paths['media'], paths['download']
-        
-        placement_method = self.ui.get_placement_method()
-        
-        clear_host()
-        logging.info("Préparation de l'analyse...")
-        
-        video_files = self.fs.collect_video_files(download_path)
 
-        plex_enabled = self.ui.confirm_plex_usage()
-        if plex_enabled:
-            nfo_files = self.fs.get_nfo_files_from_api(media_path, self.config.api_base_url)
-        else:
-            nfo_files = self.fs.list_nfo_files(media_path)
-        
-        if not video_files:
-            logging.warning("Aucun fichier vidéo trouvé dans le dossier de téléchargement. Fin du script.")
+        if not self.lock.acquire():
+            logging.warning("Une autre instance de Fankai-Placement est déjà en cours d'exécution.")
+            logging.warning("Cette exécution sera ignorée.")
             return
 
-        if not nfo_files:
-            logging.warning("Aucun fichier NFO de référence trouvé (localement ou via l'API). Impossible de trouver des correspondances.")
-            return
-            
-        rename_dict = self.db.load_rename_dict()
+        try:
+            self.ui.display_intro()
 
-        standard_matches, unmatched, op_matches = self.matcher.find_matches(video_files, nfo_files, rename_dict)
+            self.db.update_rename_list_from_github(self.config.github_repo)
 
-        if not standard_matches and not op_matches and not unmatched:
-             logging.warning("Aucune correspondance trouvée pour les fichiers vidéo.")
-        else:
-            placed_files, updated_series = self.placer.place_files(standard_matches, op_matches, placement_method, media_path)
-            
-            if placed_files:
-                logging.info(f"\nPlacement terminé. {len(placed_files)} fichier(s) source traité(s).")
-                logging.info(f"Séries mises à jour : {', '.join(updated_series) or 'Aucune'}")
-                
-                if placement_method == 'c':
-                    self.ui.confirm_cleanup(placed_files)
+            paths = self.ui.get_paths()
+            media_path, download_path = paths['media'], paths['download']
 
-                if self.ui.ask_yes_no("Lancer Fankai-Metadata pour mettre à jour les métadonnées ?", default_yes=self.args.auto):
-                    self.fs.launch_metadata_script(self.config.metadata_script_path, list(updated_series))
+            placement_method = self.ui.get_placement_method()
+
+            clear_host()
+            logging.info("Préparation de l'analyse...")
+
+            video_files = self.fs.collect_video_files(download_path)
+
+            plex_enabled = self.ui.confirm_plex_usage()
+            if plex_enabled:
+                nfo_files = self.fs.get_nfo_files_from_api(media_path, self.config.api_base_url)
             else:
-                logging.info("Aucun nouveau fichier n'a été placé.")
+                nfo_files = self.fs.list_nfo_files(media_path)
 
-        self.ui.handle_unmatched(unmatched, nfo_files, placement_method, media_path)
+            if not video_files:
+                logging.warning("Aucun fichier vidéo trouvé dans le dossier de téléchargement. Fin du script.")
+                return
 
-        logging.info("\nScript terminé.")
+            if not nfo_files:
+                logging.warning("Aucun fichier NFO de référence trouvé (localement ou via l'API). Impossible de trouver des correspondances.")
+                return
+
+            rename_dict = self.db.load_rename_dict()
+
+            standard_matches, unmatched, op_matches = self.matcher.find_matches(video_files, nfo_files, rename_dict)
+
+            if not standard_matches and not op_matches and not unmatched:
+                 logging.warning("Aucune correspondance trouvée pour les fichiers vidéo.")
+            else:
+                placed_files, updated_series = self.placer.place_files(standard_matches, op_matches, placement_method, media_path)
+
+                if placed_files:
+                    logging.info(f"\nPlacement terminé. {len(placed_files)} fichier(s) source traité(s).")
+                    logging.info(f"Séries mises à jour : {', '.join(updated_series) or 'Aucune'}")
+
+                    if placement_method == 'c':
+                        self.ui.confirm_cleanup(placed_files)
+
+                    if self.ui.ask_yes_no("Lancer Fankai-Metadata pour mettre à jour les métadonnées ?", default_yes=self.args.auto):
+                        self.fs.launch_metadata_script(self.config.metadata_script_path, list(updated_series))
+                else:
+                    logging.info("Aucun nouveau fichier n'a été placé.")
+
+            self.ui.handle_unmatched(unmatched, nfo_files, placement_method, media_path)
+
+            logging.info("\nScript terminé.")
+        finally:
+            self.lock.release()
 
 # --- Point d'entrée ---
 
